@@ -3,7 +3,6 @@ import streamlit as st
 import numpy as np
 import cv2
 import os
-import traceback
 import tensorflow as tf
 from tensorflow.keras.models import load_model
 from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, Flatten, Dense, Dropout
@@ -25,7 +24,7 @@ try:
     phase1_model = load_model(MODEL_PATH)
     st.success("✅ Phase 1 model loaded successfully!")
 
-    # Phase 2 model architecture – EXPLICIT NAMES to prevent collision
+    # Phase 2 model architecture – EXPLICIT NAMES to prevent name collisions
     st.info("Building Phase 2 model architecture...")
     inputs = Input(shape=(224, 224, 1), name="input_layer")
 
@@ -61,7 +60,7 @@ try:
 except Exception as e:
     st.error(f"Model loading failed: {str(e)}")
     st.exception(e)
-    st.stop()  # Stop execution if models fail to load
+    st.stop()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # STREAMLIT UI
@@ -93,25 +92,59 @@ if uploaded_file is not None:
         # Phase 2: Grad-CAM only for Tumor with good confidence
         if pred_class == "Tumor" and pred_conf >= TUMOR_THRESHOLD:
             st.subheader("Phase 2: Tumor Localization (Grad-CAM)")
-            with st.spinner("Computing Grad-CAM..."):
-                last_conv = get_last_conv_layer_name(phase2_model)
-                heatmap, _ = make_gradcam_heatmap(img_tensor, phase2_model, last_conv)
+            
+            with st.spinner("Computing Grad-CAM heatmap... (this may take 10–30 seconds)"):
+                try:
+                    st.write("Step 1: Finding last conv layer...")
+                    last_conv = get_last_conv_layer_name(phase2_model)
+                    st.write(f"→ Last conv layer: **{last_conv}**")
 
-                heatmap_resized = cv2.resize(heatmap, (224, 224))
-                heatmap_color = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
-                original_uint8 = (img_gray * 255).astype(np.uint8)
-                overlay = cv2.addWeighted(
-                    cv2.cvtColor(original_uint8, cv2.COLOR_GRAY2BGR), 0.6,
-                    heatmap_color, 0.4, 0
-                )
+                    st.write("Step 2: Computing Grad-CAM...")
+                    heatmap_raw, pred_index = make_gradcam_heatmap(img_tensor, phase2_model, last_conv)
+                    st.write(f"→ Computed for predicted class index: {pred_index}")
 
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.image(original_uint8, caption="Original", channels="GRAY", use_column_width=True)
-                with col2:
-                    st.image(heatmap_color, caption="Grad-CAM Heatmap", use_column_width=True)
-                with col3:
-                    st.image(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB), caption="Overlay", use_column_width=True)
+                    # Convert to numpy and check for issues
+                    heatmap = np.array(heatmap_raw)
+                    st.write(f"Heatmap raw shape: {heatmap.shape}, dtype: {heatmap.dtype}")
+                    st.write(f"Heatmap stats → min: {heatmap.min():.4f}, max: {heatmap.max():.4f}, mean: {heatmap.mean():.4f}, NaN count: {np.isnan(heatmap).sum()}")
+
+                    if np.isnan(heatmap).any() or np.isinf(heatmap).any():
+                        st.warning("Heatmap contains NaN or Inf values — replacing with zeros.")
+                        heatmap = np.nan_to_num(heatmap, nan=0.0, posinf=0.0, neginf=0.0)
+
+                    heatmap = np.maximum(heatmap, 0)
+                    max_val = heatmap.max()
+                    if max_val > 0:
+                        heatmap = heatmap / max_val
+                    else:
+                        st.warning("Heatmap is completely flat (all zeros) — no strong activation found.")
+                        heatmap = np.zeros_like(heatmap)
+
+                    st.write(f"Normalized heatmap max: {heatmap.max():.4f}")
+
+                    # Resize & colormap
+                    heatmap_resized = cv2.resize(heatmap, (224, 224))
+                    heatmap_uint8 = np.uint8(255 * heatmap_resized)
+                    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+
+                    # Original image prep
+                    original_uint8 = (img_gray * 255).astype(np.uint8)
+                    original_bgr = cv2.cvtColor(original_uint8, cv2.COLOR_GRAY2BGR)
+                    overlay = cv2.addWeighted(original_bgr, 0.6, heatmap_color, 0.4, 0)
+
+                    # Display
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.image(original_uint8, caption="Original", channels="GRAY", use_column_width=True)
+                    with col2:
+                        st.image(heatmap_color, caption="Grad-CAM Heatmap", use_column_width=True)
+                    with col3:
+                        st.image(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB), caption="Overlay (Original + Heatmap)", use_column_width=True)
+
+                except Exception as gradcam_err:
+                    st.error(f"Grad-CAM computation failed: {str(gradcam_err)}")
+                    st.exception(gradcam_err)
+                    st.info("Tip: Try a different image with a more prominent tumor region.")
         else:
             st.info(f"Phase 2 skipped ({pred_class} detected)")
 
